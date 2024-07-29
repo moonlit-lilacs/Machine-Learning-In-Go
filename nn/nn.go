@@ -2,13 +2,14 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"liz/assert"
 	"liz/utils"
+	"log"
 	"math"
 	"math/rand"
 	"os"
+	"runtime/pprof"
 )
 
 const (
@@ -168,27 +169,31 @@ func printMat(m mat, padding int, name string) {
 
 // Applies the sigmoid function to a matrix using the Map function from my utils library.
 func matSig(m *mat) *mat {
-	m.es = utils.Map(m.es, sigmoid)
+	// m.es = utils.Map(m.es, sigmoid)
+	utils.MapInPlace(m.es, sigmoid)
 	return m
 }
 
 // Applies the Leaky ReLU function to a matrix using the Map function from my utils library.
 func matReLU(m *mat) *mat {
-	m.es = utils.Map(m.es, leakyReLU)
+	// m.es = utils.Map(m.es, leakyReLU)
+	utils.MapInPlace(m.es, leakyReLU)
 	return m
 }
 
 // Uses a simple lambda function to return whatever value is passed in matFill and combines that
 // with our newly-made Map function
 func matFill(m *mat, val float64) *mat {
-	m.es = utils.Map(m.es, func(float64) float64 { return val })
+	// m.es = utils.Map(m.es, func(float64) float64 { return val })
+	utils.MapInPlace(m.es, func(float64) float64 { return val })
 	return m
 }
 
 // Simply randomizes a matrix using a lambda function and a map function, but it is now obsolete
 // because we use nnGlorotInit to seed our neural nets.
 func matRand(m *mat, high, low float64) *mat {
-	m.es = utils.Map(m.es, func(float64) float64 { return randFloat()*(high-low) + low })
+	// m.es = utils.Map(m.es, func(float64) float64 { return randFloat()*(high-low) + low })
+	utils.MapInPlace(m.es, func(float64) float64 { return randFloat()*(high-low) + low })
 	return m
 }
 
@@ -309,7 +314,7 @@ func nnPrint(net *nn, name string) {
 	fmt.Printf("]\n")
 }
 
-// Randomizes a neural network naiively. This is not deprecated because nnGlorotInit is a superior
+// Randomizes a neural network naiively. This is deprecated because nnGlorotInit is a superior
 // way to initialize a neural network.
 func nnRand(net *nn, high, low float64) {
 	for i := uint64(0); i < net.count; i++ {
@@ -344,7 +349,7 @@ func nnForward(net *nn) {
 // Computes the cost of the network by taking in the training input (ti) and training output (to),
 // forwarding the input through the network, and comparing the output of the neural net to the
 // actual output. It squares this difference and adds it to the cost.
-func nnCost(net nn, ti, to *mat) float64 {
+func nnMeanSquareLoss(net nn, ti, to *mat) float64 {
 	assert.Assert(ti.rows == to.rows)
 	assert.Assert(to.cols == net.activations[net.count].cols)
 
@@ -445,20 +450,24 @@ func nnBackProp(net, g *nn, ti, to *mat, clip float64) {
 		}
 	}
 
-	//Averages the biases and weights over the number of training examples. Could possibly be done
-	//with matScale more efficiently/cleanly?
+	//Averages the biases and weights over the number of training examples.
+	scalar := 1 / float64(ti.rows)
 	for i := uint64(0); i < g.count; i++ {
-		for j := uint64(0); j < g.weights[i].rows; j++ {
-			for k := uint64(0); k < g.weights[i].cols; k++ {
-				*g.weights[i].At(j, k) /= float64(ti.rows)
-			}
-		}
+		// for j := uint64(0); j < g.weights[i].rows; j++ {
+		// 	for k := uint64(0); k < g.weights[i].cols; k++ {
+		// 		*g.weights[i].At(j, k) /= float64(ti.rows)
+		// 	}
+		// }
 
-		for j := uint64(0); j < g.biases[i].rows; j++ {
-			for k := uint64(0); k < g.biases[i].cols; k++ {
-				*g.biases[i].At(j, k) /= float64(ti.rows)
-			}
-		}
+		// for j := uint64(0); j < g.biases[i].rows; j++ {
+		// 	for k := uint64(0); k < g.biases[i].cols; k++ {
+		// 		*g.biases[i].At(j, k) /= float64(ti.rows)
+		// 	}
+		// }
+
+		matScale(&g.weights[i], scalar)
+		matScale(&g.biases[i], scalar)
+
 	}
 
 }
@@ -469,12 +478,14 @@ func nnLearn(net, g *nn, rate float64, normalizationValue float64) {
 	for i := uint64(0); i < net.count; i++ {
 		for j := uint64(0); j < net.weights[i].rows; j++ {
 			for k := uint64(0); k < net.weights[i].cols; k++ {
-				*net.weights[i].At(j, k) -= rate*(*g.weights[i].At(j, k)) + normalizationValue*(*net.weights[i].At(j, k))
+				val := net.weights[i].At(j, k)
+				*val -= rate*(*g.weights[i].At(j, k)) + normalizationValue*(*val)
 			}
 		}
 		for j := uint64(0); j < net.biases[i].rows; j++ {
 			for k := uint64(0); k < net.biases[i].cols; k++ {
-				*net.biases[i].At(j, k) -= rate*(*g.biases[i].At(j, k)) + normalizationValue*(*net.biases[i].At(j, k))
+				val := net.biases[i].At(j, k)
+				*val -= rate*(*g.biases[i].At(j, k)) + normalizationValue*(*val)
 			}
 		}
 	}
@@ -484,8 +495,9 @@ func nnLearn(net, g *nn, rate float64, normalizationValue float64) {
 func nnGlorotInit(net *nn) {
 	for i := range net.count {
 		limit := math.Sqrt(6.0 / float64(net.weights[i].cols+net.weights[i].rows))
-		net.weights[i].es = utils.Map(net.weights[i].es, func(float64) float64 { return randFloat()*2*limit - limit })
-		net.biases[i].es = utils.Map(net.biases[i].es, func(float64) float64 { return 0 })
+		// net.weights[i].es = utils.Map(net.weights[i].es, func(float64) float64 { return randFloat()*2*limit - limit })
+		// net.biases[i].es = utils.Map(net.biases[i].es, func(float64) float64 { return 0 })
+		utils.MapInPlace(net.weights[i].es, func(float64) float64 { return randFloat()*2*limit - limit })
 	}
 
 }
@@ -500,6 +512,9 @@ func clipGradient(value, clipValue float64) float64 {
 	return value
 }
 
+// Implements the ADAM optimizer. M, V are the set of moments and velocities for each parameter in the original neural network 'net'. They are
+// instantiated as neural networks themselves for ease since they will necessarily have a spot for each weight and bias -- that being said
+// it may be useful to create a bespoke struct specifically for them to save on save, especially w.r.t larger models.
 func optimize_adam(net, g, m, v *nn, rate, epsilon, beta1, beta2 float64, epoch uint64) {
 
 	epoch_normalized := math.Max(float64(epoch), 1)
@@ -544,14 +559,7 @@ func optimize_adam(net, g, m, v *nn, rate, epsilon, beta1, beta2 float64, epoch 
 
 func exportNeuralNetworkBinary(net *nn, path string) error {
 
-	if _, err := os.Stat(path); err == nil {
-		if err := os.Remove(path); err != nil {
-			fmt.Printf("Error removing file: %v\n", err)
-			return errors.New("error removing file")
-		}
-	}
 	file, err := os.Create(path)
-
 	if err != nil {
 		return err
 	}
@@ -661,6 +669,17 @@ var NUMS = 100
 
 func main() {
 
+	f, err := os.Create("cpu.prof")
+	if err != nil {
+		log.Fatal("could not create CPU profile: ", err)
+	}
+	defer f.Close()
+
+	if err := pprof.StartCPUProfile(f); err != nil {
+		log.Fatal("could not start CPU profile: ", err)
+	}
+	defer pprof.StopCPUProfile()
+
 	n := NUMS
 	rows := uint64(n * n)
 	ti := matAlloc(rows, 2)
@@ -680,7 +699,7 @@ func main() {
 	// printMat(ti, 4, "ti")
 	// printMat(to, 4, "to")
 
-	arch := []uint64{2, 8, 8, 1}
+	arch := []uint64{2, 8, 4, 8, 1}
 	net := nnAlloc(arch)
 	g := nnAlloc(arch)
 
@@ -689,28 +708,37 @@ func main() {
 	matCopy(&net.activations[0], matRow(&ti, 1))
 	nnForward(net)
 	nnPrint(net, "net")
-	initialCost := nnCost(*net, &ti, &to)
+	initialCost := nnMeanSquareLoss(*net, &ti, &to)
 
 	clipValue := .4
 	rate := 1e-3
 	beta1 := 0.9
-	beta2 := 0.999
+	beta2 := 0.99
 	epsilon := 1e-8
 	moments := nnAlloc(arch)
 	velocities := nnAlloc(arch)
 
 	epoch := uint64(0)
-	cost := nnCost(*net, &ti, &to)
-	for cost > 1e-5 {
+	// cost := nnMeanSquareLoss(*net, &ti, &to)
+	// for cost > 1e-5 {
+	// 	nnBackProp(net, g, &ti, &to, clipValue)
+	// 	//nnLearn(net, g, rate, lambda)
+	// 	optimize_adam(net, g, moments, velocities, rate, epsilon, beta1, beta2, epoch)
+	// 	cost = nnMeanSquareLoss(*net, &ti, &to)
+	// 	fmt.Printf("%v: cost = %v\n", epoch, cost)
+	// 	epoch++
+	// }
+
+	for range 10000 {
 		nnBackProp(net, g, &ti, &to, clipValue)
 		//nnLearn(net, g, rate, lambda)
 		optimize_adam(net, g, moments, velocities, rate, epsilon, beta1, beta2, epoch)
-		fmt.Printf("%v: cost = %v\n", epoch, nnCost(*net, &ti, &to))
+		// cost = nnMeanSquareLoss(*net, &ti, &to)
+		// fmt.Printf("%v: cost = %v\n", epoch, cost)
 		epoch++
-		cost = nnCost(*net, &ti, &to)
 	}
 
-	finalCost := nnCost(*net, &ti, &to)
+	finalCost := nnMeanSquareLoss(*net, &ti, &to)
 	nnPrint(net, "final net")
 	fmt.Printf("cost = %v\n", initialCost)
 	fmt.Printf("final cost = %v\n", finalCost)
