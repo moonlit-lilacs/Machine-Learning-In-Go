@@ -5,15 +5,13 @@ import (
 	"fmt"
 	"liz/assert"
 	"liz/utils"
-	"log"
 	"math"
 	"math/rand"
 	"os"
-	"runtime/pprof"
 )
 
 const (
-	version = 0.2
+	version = 0.3
 )
 
 // Matrix construct. Stride is number of elements that must be skipped to get to the next row, which
@@ -47,6 +45,8 @@ func (e *DiffVersionWarning) Error() string {
 }
 
 // gives us a pointer to the value at a specific row and column of a matrix.
+//
+//go:inline
 func (m *mat) At(row, col uint64) *float64 {
 	return &m.es[row*m.stride+col]
 }
@@ -61,43 +61,6 @@ func newMat(r, c, s uint64, e []float64) mat {
 	}
 	return m
 }
-
-//------------------ Cost function for a perceptron, now obsolete ----------------------------
-// Calculates the cost of our two weights and bias, wanting as close as 0 as possible.
-// func cost(w1, w2, b float64, m *mat) float64 {
-// 	result := 0.0
-// 	for i := 0; i < m.rows; i++ {
-// 		x1 := *m.At(i, 0)
-// 		x2 := *m.At(i, 1)
-// 		y := sigmoid(x1*w1 + x2*w2 + b)
-// 		d := y - *m.At(i, 2)
-// 		result += d * d
-// 	}
-// 	return result / float64(m.rows)
-// }
-//---------------------------------------------------------------------------------------------
-
-//------------ Function to compute the gradient of a perception, now obsolete ------------------
-// func gcost(w1, w2, b float64, m *mat) (dw1, dw2, db float64) {
-// 	dw1, dw2, db = 0, 0, 0
-// 	for i := 0; i < m.rows; i++ {
-// 		xi := *m.At(i, 0)
-// 		yi := *m.At(i, 1)
-// 		zi := *m.At(i, 2)
-// 		ai := sigmoid(w1*xi + w2*yi + b)
-// 		di := 2 * (ai - zi) * ai * (1 - ai)
-
-// 		dw1 += di * xi
-// 		dw2 += di * yi
-// 		db += di
-// 	}
-// 	dw1 /= float64(m.rows)
-// 	dw2 /= float64(m.rows)
-// 	db /= float64(m.rows)
-
-// 	return dw1, dw2, db
-// }
-//----------------------------------------------------------------------------------------------
 
 // alias for the rand.Float64() function
 func randFloat() float64 {
@@ -125,6 +88,28 @@ func derivLeakyReLU(x float64) float64 {
 	} else {
 		return 0.01
 	}
+}
+
+// Defining the Huber Loss function
+func huberLoss(predicted, actual, delta float64) float64 {
+	diff := math.Abs(predicted - actual)
+	if diff <= delta {
+		return 0.5 * diff * diff
+	} else {
+		return delta * (diff - 0.5*delta)
+	}
+}
+
+// Defining the derivative of the Huber loss function
+func huberLossDerivative(predicted, actual, delta float64) float64 {
+	diff := predicted - actual
+	if math.Abs(diff) <= delta {
+		return diff
+	}
+	if diff > 0 {
+		return delta
+	}
+	return -delta
 }
 
 // Returns a single row from the matrix by finding the start of the elements and selecting the slice
@@ -197,7 +182,8 @@ func matRand(m *mat, high, low float64) *mat {
 	return m
 }
 
-// Computes the dot product of two matrices using the definition of the dot product
+// Computes the dot product of two matrices using the definition of the dot product. Now replaced by
+// cachedMatDot to improve performance.
 func matDot(a, b *mat) *mat {
 	assert.Assert(a.cols == b.rows)
 	dst := mat{
@@ -216,6 +202,38 @@ func matDot(a, b *mat) *mat {
 		}
 	}
 	return &dst
+}
+
+// Input: Matrices A (mxn), B (nxr), dst (mxr)
+func cachedMatDot(a, b, dst *mat) {
+	assert.Assert(a.cols == b.rows)
+	assert.Assert(dst.rows == a.rows)
+	assert.Assert(dst.cols == b.cols)
+
+	m := a.rows
+	n := a.cols
+	r := b.cols
+
+	//tiling constant defined as the square root of the size of the L1 cache (512KB on my machine) divided by the size of each element
+	//(8 bytes in the case of double precision floats)
+	tiling_constant := uint64(math.Sqrt(512 * 1_000 / 8))
+
+	for i := uint64(0); i < m; i += tiling_constant {
+		for j := uint64(0); j < r; j += tiling_constant {
+			for k := uint64(0); k < n; k += tiling_constant {
+
+				for l := i; l < uint64(utils.MinInt(i+tiling_constant, m)); l++ {
+					for h := j; h < uint64(utils.MinInt(j+tiling_constant, r)); h++ {
+						sum := float64(0)
+						for g := k; g < uint64(utils.MinInt(k+tiling_constant, n)); g++ {
+							sum += *a.At(l, g) * *b.At(g, h)
+						}
+						*dst.At(l, h) += sum
+					}
+				}
+			}
+		}
+	}
 }
 
 // Adds the source matrix to the destination matrix.
@@ -335,12 +353,19 @@ func nnFill(net *nn, val float64) {
 	matFill(&net.activations[net.count], val)
 }
 
+func matZero(m *mat) {
+	for i := range m.es {
+		m.es[i] = 0
+	}
+}
+
 // Forwards values through a neural network by computing the dot product of the current layer's
 // activations and weights and stores it in the next layer's activation, then applies the bias. Finally
 // it applies the ReLU function.
 func nnForward(net *nn) {
 	for i := uint64(0); i < net.count; i++ {
-		net.activations[i+1] = *matDot(&net.activations[i], &net.weights[i])
+		matZero(&net.activations[i+1])
+		cachedMatDot(&net.activations[i], &net.weights[i], &net.activations[i+1])
 		matSum(&net.activations[i+1], &net.biases[i])
 		matReLU(&net.activations[i+1])
 	}
@@ -368,9 +393,29 @@ func nnMeanSquareLoss(net nn, ti, to *mat) float64 {
 	return cost / float64(ti.rows)
 }
 
+func nnHuberLoss(net *nn, ti, to *mat, delta float64) float64 {
+	assert.Assert(ti.rows == to.rows)
+	assert.Assert(to.cols == net.activations[net.count].cols)
+
+	loss := float64(0)
+	for i := range ti.rows {
+		x := matRow(ti, i)
+		y := matRow(to, i)
+		matCopy(&net.activations[0], x)
+		nnForward(net)
+		for j := uint64(0); j < to.cols; j++ {
+			predicted := *net.activations[net.count].At(0, j)
+			actual := *y.At(0, j)
+			loss += huberLoss(predicted, actual, delta)
+		}
+	}
+	return loss / float64(ti.rows)
+
+}
+
 // Back propegates the neural network by computing the partial derivatives of the weights and biases
 // and adds them to the gradient so that they can be applied during the learn step.
-func nnBackProp(net, g *nn, ti, to *mat, clip float64) {
+func nnBackProp(net, g *nn, ti, to *mat, clip, delta float64) {
 	assert.Assert(ti.rows == to.rows)
 	assert.Assert(net.activations[net.count].cols == to.cols)
 
@@ -387,13 +432,16 @@ func nnBackProp(net, g *nn, ti, to *mat, clip float64) {
 		//We will the activations in our gradient with 0s because we'll be using them each loop to
 		//store our intermediate values.
 		for j := uint64(0); j <= net.count; j++ {
-			matFill(&g.activations[j], 0.0)
+			matZero(&g.activations[j])
 		}
 
 		//We store the difference between our predicted output and the actual output in the
 		//activations
 		for j := range to.cols {
-			*(g.activations[g.count]).At(0, j) = *net.activations[g.count].At(0, j) - *to.At(i, j)
+			//*(g.activations[g.count]).At(0, j) = *net.activations[g.count].At(0, j) - *to.At(i, j)
+			predicted := *net.activations[g.count].At(0, j)
+			actual := *to.At(i, j)
+			*(g.activations[g.count]).At(0, j) = huberLossDerivative(predicted, actual, delta)
 		}
 
 		//We loop through each layer starting from the last and moving backwards because the partial
@@ -665,92 +713,104 @@ func importNeuralNetworkBinary(path string) (*nn, error) {
 	return net, returnErr
 }
 
+// func normalize(input, min, max float64) float64 {
+// 	return (input - min) / (max - min)
+// }
+
+// func denormalize(input, min, max float64) float64 {
+// 	return input*(max-min) + min
+// }
+
 var NUMS = 100
 
 func main() {
 
-	f, err := os.Create("cpu.prof")
-	if err != nil {
-		log.Fatal("could not create CPU profile: ", err)
-	}
-	defer f.Close()
+	// f, err := os.Create("large.prof")
+	// if err != nil {
+	// 	log.Fatal("could not create CPU profile: ", err)
+	// }
+	// defer f.Close()
 
-	if err := pprof.StartCPUProfile(f); err != nil {
-		log.Fatal("could not start CPU profile: ", err)
-	}
-	defer pprof.StopCPUProfile()
+	// if err := pprof.StartCPUProfile(f); err != nil {
+	// 	log.Fatal("could not start CPU profile: ", err)
+	// }
+	// defer pprof.StopCPUProfile()
 
-	n := NUMS
-	rows := uint64(n * n)
-	ti := matAlloc(rows, 2)
-	to := matAlloc(rows, 1)
-
-	count := uint64(0)
-	for i := 1; i <= NUMS; i++ {
-		for j := 1; j <= NUMS; j++ {
-			z := i + j
-			*ti.At(count, 0) = float64(i)
-			*ti.At(count, 1) = float64(j)
-			*to.At(count, 0) = float64(z)
-			count++
-		}
-	}
-
-	// printMat(ti, 4, "ti")
-	// printMat(to, 4, "to")
-
-	arch := []uint64{2, 8, 4, 8, 1}
+	arch := []uint64{2, 128, 128, 1}
 	net := nnAlloc(arch)
+	nnGlorotInit(net)
 	g := nnAlloc(arch)
 
-	nnGlorotInit(net)
-
-	matCopy(&net.activations[0], matRow(&ti, 1))
-	nnForward(net)
-	nnPrint(net, "net")
-	initialCost := nnMeanSquareLoss(*net, &ti, &to)
-
 	clipValue := .4
-	rate := 1e-3
+	rate := 1e-4
 	beta1 := 0.9
 	beta2 := 0.99
 	epsilon := 1e-8
+	delta := 1.0
 	moments := nnAlloc(arch)
 	velocities := nnAlloc(arch)
 
-	epoch := uint64(0)
-	// cost := nnMeanSquareLoss(*net, &ti, &to)
-	// for cost > 1e-5 {
-	// 	nnBackProp(net, g, &ti, &to, clipValue)
+	for data := 10; data <= NUMS; data += 10 {
+		n := data
+		rows := uint64(n * n)
+		ti := matAlloc(rows, 2)
+		to := matAlloc(rows, 1)
+
+		count := uint64(0)
+		for i := 1; i <= data; i++ {
+			for j := 1; j <= data; j++ {
+				z := i + j
+				*ti.At(count, 0) = float64(i)
+				*ti.At(count, 1) = float64(j)
+				*to.At(count, 0) = float64(z)
+				count++
+			}
+		}
+
+		epoch := uint64(0)
+		cost := nnHuberLoss(net, &ti, &to, delta)
+		for cost > 1e-6 {
+			nnBackProp(net, g, &ti, &to, clipValue, delta)
+			//nnLearn(net, g, rate, lambda)
+			optimize_adam(net, g, moments, velocities, rate, epsilon, beta1, beta2, epoch)
+			cost = nnHuberLoss(net, &ti, &to, delta)
+			fmt.Printf("%v: cost = %v\n", epoch, cost)
+			epoch++
+		}
+
+		rate *= 0.8
+	}
+
+	// matCopy(&net.activations[0], matRow(&ti, 1))
+	// nnForward(net)
+	// // nnPrint(net, "net")
+	// initialCost := nnMeanSquareLoss(*net, &ti, &to)
+
+	// for range 10000 {
+	// 	nnBackProp(net, g, &ti, &to, clipValue, delta)
 	// 	//nnLearn(net, g, rate, lambda)
 	// 	optimize_adam(net, g, moments, velocities, rate, epsilon, beta1, beta2, epoch)
-	// 	cost = nnMeanSquareLoss(*net, &ti, &to)
+	// 	// cost := nnMeanSquareLoss(*net, &ti, &to)
+	// 	cost := nnHuberLoss(net, &ti, &to, delta)
 	// 	fmt.Printf("%v: cost = %v\n", epoch, cost)
 	// 	epoch++
 	// }
 
-	for range 10000 {
-		nnBackProp(net, g, &ti, &to, clipValue)
-		//nnLearn(net, g, rate, lambda)
-		optimize_adam(net, g, moments, velocities, rate, epsilon, beta1, beta2, epoch)
-		// cost = nnMeanSquareLoss(*net, &ti, &to)
-		// fmt.Printf("%v: cost = %v\n", epoch, cost)
-		epoch++
-	}
-
-	finalCost := nnMeanSquareLoss(*net, &ti, &to)
-	nnPrint(net, "final net")
-	fmt.Printf("cost = %v\n", initialCost)
-	fmt.Printf("final cost = %v\n", finalCost)
-	fmt.Printf("difference in init and final cost = %v\n", initialCost-finalCost)
+	// finalCost := nnHuberLoss(*net, &ti, &to,delta)
+	// nnPrint(net, "final net")
+	// fmt.Printf("cost = %v\n", initialCost)
+	// fmt.Printf("final cost = %v\n", finalCost)
+	// fmt.Printf("difference in init and final cost = %v\n", initialCost-finalCost)
+	// fmt.Printf("epochs passed: %v\n", epoch)
 
 	exportNeuralNetworkBinary(net, "adder.nn")
 
-	// for x := 0; x < NUMS*20; x++ {
-	// 	for y := 0; y < NUMS*20; y++ {
-	// 		*net.activations[0].At(0, 0) = float64(x + 1)
-	// 		*net.activations[0].At(0, 1) = float64(y + 1)
-	// 		nnForward(net)
-	// 		fmt.Printf("%v + %v = %v\n", x+1, y+1, *net.activations[net.count].At(0, 0))
-	// 	}
+	for x := 0; x < 1000; x += 50 {
+		for y := 0; y < 1000; y += 50 {
+			*net.activations[0].At(0, 0) = float64(x + 1)
+			*net.activations[0].At(0, 1) = float64(y + 1)
+			nnForward(net)
+			fmt.Printf("%v + %v = %v\n", x+1, y+1, math.Round(*net.activations[net.count].At(0, 0)))
+		}
+	}
 }

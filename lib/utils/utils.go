@@ -1,5 +1,9 @@
 package utils
 
+type Number interface {
+	int | int8 | int16 | int32 | int64 | uint | uint8 | uint16 | uint32 | uint64 | uintptr | float32 | float64
+}
+
 func Map[T any, U any](input []T, f func(T) U) []U {
 	output := make([]U, len(input))
 	for i, v := range input {
@@ -13,5 +17,14 @@ func Map[T any, U any](input []T, f func(T) U) []U {
 func MapInPlace[T any](input []T, f func(T) T) {
 	for i := range input {
 		input[i] = f(input[i])
+	}
+}
+
+//go:inline
+func MinInt[T Number](a, b T) T {
+	if a <= b {
+		return a
+	} else {
+		return b
 	}
 }
